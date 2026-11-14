@@ -1,0 +1,33 @@
+{
+  "AccountId": "<ACCOUNT_ID>",
+  "ConfirmationRequired": false,
+  "Priority": 10,
+  "Description": "aws-bytes approach 3 - copy 10 Citi Bike 2026 zips",
+  "RoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/poc-s3-migration-batchops",
+  "Operation": {
+    "S3PutObjectCopy": {
+      "TargetResource": "arn:aws:s3:::aws-bytes-s3-migration-<ACCOUNT_ID>-ap-south-1",
+      "TargetKeyPrefix": "raw/citibike/batchops"
+    }
+  },
+  "Manifest": {
+    "Spec": {
+      "Format": "S3BatchOperations_CSV_20180820",
+      "Fields": [
+        "Bucket",
+        "Key"
+      ]
+    },
+    "Location": {
+      "ObjectArn": "arn:aws:s3:::aws-bytes-s3-migration-<ACCOUNT_ID>-ap-south-1/ops/batchops/manifests/manifest.csv",
+      "ETag": "<MANIFEST_ETAG>"
+    }
+  },
+  "Report": {
+    "Bucket": "arn:aws:s3:::aws-bytes-s3-migration-<ACCOUNT_ID>-ap-south-1",
+    "Prefix": "ops/batchops/reports",
+    "Format": "Report_CSV_20180820",
+    "Enabled": true,
+    "ReportScope": "AllTasks"
+  }
+}

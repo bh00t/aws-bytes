@@ -1,0 +1,490 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS Bytes - S3 cross-account, cross-region migration PoC.
+  v0.3 = destination bucket + least-privilege runner ROLE for approach 1 (aws s3 sync).
+  v0.4 = approach 2: Step Functions (Map) + 2 Lambdas, each Lambda with its own least-privilege role.
+  v0.5 = approach 3: S3 Batch Operations copy job role + runner rights to create/describe the job.
+  Deploy with your admin identity, then switch into the role to run the PoC.
+
+Parameters:
+  SourceBucket:
+    Type: String
+    Default: tripdata
+    Description: Public source bucket owned by another account (Citi Bike, us-east-1)
+  SourceRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region of the source bucket
+  SourcePrefix:
+    Type: String
+    Default: "2026"
+    Description: Only keys starting with this are copied
+  SourceSuffix:
+    Type: String
+    Default: -citibike-tripdata.zip
+    Description: Only keys ending with this are copied
+  BucketPrefix:
+    Type: String
+    Default: aws-bytes-s3-migration
+    Description: Destination bucket = <prefix>-<account id>-<region> (globally unique)
+  StepFnPrefix:
+    Type: String
+    Default: raw/citibike/stepfn/
+    Description: Destination prefix for approach 2
+  BatchOpsPrefix:
+    Type: String
+    Default: raw/citibike/batchops/
+    Description: Destination prefix for approach 3 (the copied data)
+  BatchOpsMetaPrefix:
+    Type: String
+    Default: ops/batchops/
+    Description: Approach 3 manifest (manifests/) and completion reports (reports/) - kept out of raw/
+
+Resources:
+  DestBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${BucketPrefix}-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------- Approach 1: runner role (unchanged from v0.3) ----------------
+  RunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: poc-s3-migration-runner
+      MaxSessionDuration: 3600
+      # Any IAM user/role in THIS account that is allowed sts:AssumeRole can switch in
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+
+  RunnerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: aws-bytes-s3-migration-runner
+      Roles:
+        - !Ref RunnerRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Console: lets the role see the bucket list and open buckets
+          - Sid: ConsoleBrowse
+            Effect: Allow
+            Action:
+              - s3:ListAllMyBuckets
+              - s3:GetBucketLocation
+            Resource: "*"
+
+          # Source: list the public bucket and read its files
+          - Sid: SourceList
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:aws:s3:::${SourceBucket}
+          - Sid: SourceRead
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${SourceBucket}/*
+
+          # Destination: list the bucket, write/read only under raw/
+          - Sid: DestList
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt DestBucket.Arn
+          - Sid: DestWriteRaw
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource: !Sub ${DestBucket.Arn}/raw/*
+
+          # v0.4 - Approach 2: start the state machine and read its executions
+          # (minimum to start; anything else gets added only when an AccessDenied proves it is needed)
+          - Sid: StepFnStart
+            Effect: Allow
+            Action: states:StartExecution
+            Resource: !Ref CopyStateMachine
+          - Sid: StepFnReadExecutions
+            Effect: Allow
+            Action: states:DescribeExecution
+            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${CopyStateMachine.Name}:*
+
+          # v0.5 - Approach 3: upload the manifest, download the completion report
+          - Sid: BatchOpsMetaReadWrite
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Sub ${DestBucket.Arn}/${BatchOpsMetaPrefix}*
+          # v0.5 - Approach 3: create COPY jobs only (no other Batch Ops operation types)
+          - Sid: BatchOpsCreateCopyJob
+            Effect: Allow
+            Action: s3:CreateJob
+            Resource: "*"
+            Condition:
+              StringEquals:
+                s3:RequestJobOperation: S3PutObjectCopy
+          # v0.5 - Approach 3: read job status
+          - Sid: BatchOpsDescribeJob
+            Effect: Allow
+            Action: s3:DescribeJob
+            Resource: !Sub arn:aws:s3:${AWS::Region}:${AWS::AccountId}:job/*
+          # v0.5 - Approach 3: hand ONLY the Batch Ops role to the job, and only to S3 Batch Operations
+          - Sid: BatchOpsPassRole
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt BatchOpsRole.Arn
+
+  # ---------------- Approach 2: Lambda log groups (7-day retention) ----------------
+  ListFilesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/aws-bytes-s3-migration-list-files
+      RetentionInDays: 7
+
+  CopyFileLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/aws-bytes-s3-migration-copy-file
+      RetentionInDays: 7
+
+  # ---------------- Approach 2: ListSource Lambda (list source only) ----------------
+  ListFilesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: poc-s3-migration-list-files-lambda
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: list-source-and-log
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SourceList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${SourceBucket}
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ListFilesLogGroup.Arn
+
+  ListFilesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: aws-bytes-s3-migration-list-files
+      Description: ListSource - lists the source files to copy (inline copy of list_files_lambda.py)
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt ListFilesRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ListFilesLogGroup
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          SOURCE_REGION: !Ref SourceRegion
+          SOURCE_PREFIX: !Ref SourcePrefix
+          SOURCE_SUFFIX: !Ref SourceSuffix
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+
+          SOURCE_BUCKET = os.environ["SOURCE_BUCKET"]
+          SOURCE_REGION = os.environ["SOURCE_REGION"]
+          SOURCE_PREFIX = os.environ["SOURCE_PREFIX"]
+          SOURCE_SUFFIX = os.environ["SOURCE_SUFFIX"]
+
+          s3 = boto3.client("s3", region_name=SOURCE_REGION)
+
+
+          def lambda_handler(event, context):
+              files = []
+              pages = s3.get_paginator("list_objects_v2").paginate(Bucket=SOURCE_BUCKET, Prefix=SOURCE_PREFIX)
+              for page in pages:
+                  for obj in page.get("Contents", []):
+                      if obj["Key"].endswith(SOURCE_SUFFIX):
+                          files.append({"key": obj["Key"], "size": obj["Size"]})
+
+              print(json.dumps({"count": len(files), "bytes": sum(f["size"] for f in files)}))
+              return {"files": files}
+
+  # ---------------- Approach 2: CopyOne Lambda (read source, write stepfn/ only) ----------------
+  CopyFileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: poc-s3-migration-copy-file-lambda
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: copy-one-file-and-log
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SourceRead
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${SourceBucket}/*
+              # PutObject = write the copy; GetObject = HeadObject size check
+              - Sid: DestWriteStepFn
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub ${DestBucket.Arn}/${StepFnPrefix}*
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CopyFileLogGroup.Arn
+
+  CopyFileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: aws-bytes-s3-migration-copy-file
+      Description: CopyOne - server-side copy of one file + size check (inline copy of copy_file_lambda.py)
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 900
+      Role: !GetAtt CopyFileRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref CopyFileLogGroup
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          DEST_BUCKET: !Ref DestBucket
+          DEST_PREFIX: !Ref StepFnPrefix
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+          from botocore.config import Config
+
+          s3 = boto3.client(
+              "s3",
+              config=Config(read_timeout=840, connect_timeout=10, retries={"max_attempts": 1}),
+          )
+
+          SOURCE_BUCKET = os.environ["SOURCE_BUCKET"]
+          DEST_BUCKET = os.environ["DEST_BUCKET"]
+          DEST_PREFIX = os.environ["DEST_PREFIX"]
+
+
+          def lambda_handler(event, context):
+              key = event["key"]
+              src_size = event["size"]
+              dest_key = DEST_PREFIX + key
+
+              s3.copy_object(
+                  CopySource={"Bucket": SOURCE_BUCKET, "Key": key},
+                  Bucket=DEST_BUCKET,
+                  Key=dest_key,
+              )
+
+              dst_size = s3.head_object(Bucket=DEST_BUCKET, Key=dest_key)["ContentLength"]
+
+              ok = dst_size == src_size
+
+              result = {"key": key, "src_size": src_size, "dst_size": dst_size, "ok": ok}
+              print(json.dumps(result))
+              return result
+
+  # ---------------- Approach 2: Step Functions ----------------
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: poc-s3-migration-stepfn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-the-two-lambdas
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeLambdas
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ListFilesFunction.Arn
+                  - !Sub ${ListFilesFunction.Arn}:*
+                  - !GetAtt CopyFileFunction.Arn
+                  - !Sub ${CopyFileFunction.Arn}:*
+
+  CopyStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: aws-bytes-s3-migration-copy
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionSubstitutions:
+        ListFilesFunctionArn: !GetAtt ListFilesFunction.Arn
+        CopyFileFunctionArn: !GetAtt CopyFileFunction.Arn
+      Definition:
+        Comment: List source files, copy each in parallel (server-side), summarise, fail if any file failed
+        QueryLanguage: JSONata
+        StartAt: ListSource
+        States:
+          ListSource:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: ${ListFilesFunctionArn}
+              Payload: {}
+            Output: "{% $states.result.Payload %}"
+            Retry:
+              - ErrorEquals: [States.ALL]
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Next: CopyEach
+
+          CopyEach:
+            Type: Map
+            Items: "{% $states.input.files %}"
+            MaxConcurrency: 10
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: CopyOne
+              States:
+                CopyOne:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Arguments:
+                    FunctionName: ${CopyFileFunctionArn}
+                    Payload: "{% $states.input %}"
+                  Output: "{% $states.result.Payload %}"
+                  Retry:
+                    - ErrorEquals: [States.ALL]
+                      IntervalSeconds: 5
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: [States.ALL]
+                      Next: RecordFailure
+                      Output:
+                        key: "{% $states.input.key %}"
+                        src_size: "{% $states.input.size %}"
+                        ok: false
+                        error: "{% $states.errorOutput.Error %}"
+                  End: true
+                RecordFailure:
+                  Type: Pass
+                  End: true
+            Output:
+              results: "{% $states.result %}"
+            Next: Summarise
+
+          Summarise:
+            Type: Pass
+            Output:
+              files: "{% $count($states.input.results) %}"
+              ok: "{% $count($states.input.results[ok = true]) %}"
+              failed: "{% $count($states.input.results[ok = false]) %}"
+              bytes_copied: "{% $sum($states.input.results[ok = true].dst_size) %}"
+              results: "{% $states.input.results %}"
+            Next: AllOk
+
+          AllOk:
+            Type: Choice
+            Choices:
+              - Condition: "{% $states.input.failed = 0 %}"
+                Next: Done
+            Default: SomeFilesFailed
+
+          Done:
+            Type: Succeed
+
+          SomeFilesFailed:
+            Type: Fail
+            Error: CopyFailed
+            Cause: One or more files failed or had a size mismatch - see the Summarise state output
+
+  # ---------------- Approach 3: S3 Batch Operations role (assumed by the job, not by people) ----------------
+  # Starts minimal on purpose: read source, write batchops/, read manifest, write report.
+  # Anything else gets added only when the completion report / job failure proves it is needed.
+  BatchOpsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: poc-s3-migration-batchops
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batchoperations.s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: copy-to-batchops-prefix
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SourceRead
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${SourceBucket}/*
+              - Sid: DestWriteBatchOps
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${DestBucket.Arn}/${BatchOpsPrefix}*
+              - Sid: ReadManifest
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${DestBucket.Arn}/${BatchOpsMetaPrefix}manifests/*
+              - Sid: WriteReport
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${DestBucket.Arn}/${BatchOpsMetaPrefix}reports/*
+
+Outputs:
+  BucketName:
+    Description: Destination bucket for every approach (prefix per approach under raw/)
+    Value: !Ref DestBucket
+  RunnerRoleArn:
+    Description: Use as role_arn in your AWS CLI profile
+    Value: !GetAtt RunnerRole.Arn
+  SwitchRoleUrl:
+    Description: Open this link in the console to switch into the role
+    Value: !Sub https://signin.aws.amazon.com/switchrole?roleName=${RunnerRole}&account=${AWS::AccountId}
+  StateMachineArn:
+    Description: Approach 2 - pass to aws stepfunctions start-execution
+    Value: !Ref CopyStateMachine
+  BatchOpsRoleArn:
+    Description: Approach 3 - pass to aws s3control create-job --role-arn
+    Value: !GetAtt BatchOpsRole.Arn
