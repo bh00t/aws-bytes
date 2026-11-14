@@ -138,7 +138,7 @@ Resources:
             Effect: Allow
             Action: s3:DescribeJob
             Resource: !Sub arn:aws:s3:${AWS::Region}:${AWS::AccountId}:job/*
-          # v0.5 - Approach 3: hand ONLY the Batch Ops role to the job, and only to S3 Batch Operations
+          # v0.5 - Approach 3: hand ONLY the Batch Ops role to the job (its trust policy lets only S3 Batch Operations use it)
           - Sid: BatchOpsPassRole
             Effect: Allow
             Action: iam:PassRole
