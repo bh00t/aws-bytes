@@ -73,11 +73,20 @@ aws cloudformation describe-stacks --stack-name aws-bytes-s3-migration --region 
 
 **Run:**
 ```bash
-# Copy the 10 zips; --copy-props none skips tags (the source allows reading files, not their tags)
+# 1. Preview — lists what would be copied, copies nothing (--dryrun)
+aws s3 sync s3://tripdata/ s3://<BUCKET_NAME>/raw/citibike/sync/ --exclude "*" --include "2026*-citibike-tripdata.zip" --source-region us-east-1 --region ap-south-1 --copy-props none --dryrun --profile runner
+
+# 2. Copy the 10 zips; --copy-props none skips tags (the source allows reading files, not their tags)
 aws s3 sync s3://tripdata/ s3://<BUCKET_NAME>/raw/citibike/sync/ --exclude "*" --include "2026*-citibike-tripdata.zip" --source-region us-east-1 --region ap-south-1 --copy-props none --profile runner
 ```
 **Output** (our run, trimmed):
 ```text
+# step 1
+(dryrun) copy: s3://tripdata/202601-citibike-tripdata.zip to s3://<BUCKET_NAME>/raw/citibike/sync/202601-citibike-tripdata.zip
+... (8 more files)
+(dryrun) copy: s3://tripdata/202610-citibike-tripdata.zip to s3://<BUCKET_NAME>/raw/citibike/sync/202610-citibike-tripdata.zip
+
+# step 2
 Completed 8.0 MiB/6.1 GiB (2.2 MiB/s) with 10 file(s) remaining
 copy: s3://tripdata/202604-citibike-tripdata.zip to s3://<BUCKET_NAME>/raw/citibike/sync/202604-citibike-tripdata.zip
 ... (8 more files)
@@ -89,6 +98,8 @@ copy: s3://tripdata/202609-citibike-tripdata.zip to s3://<BUCKET_NAME>/raw/citib
 - ➕ One command, nothing to build.
 - ➖ The terminal must stay open; no per-file report beyond the screen output.
 - ✔️ No 5 GB limit — the CLI splits big files into parts automatically.
+
+**Next:** ✅ [Verify the migration](#verify-the-migration-any-approach) with `<PREFIX>` = `sync`.
 
 ---
 
@@ -130,6 +141,8 @@ arn:aws:states:ap-south-1:<ACCOUNT_ID>:execution:aws-bytes-s3-migration-copy:run
 - ➕ Per-file `ok` + size check, retries you control, nothing to keep running.
 - ➖ Two small Lambdas and a state machine to maintain.
 - ⚠️ `CopyObject` copies **up to 5 GB per file** — larger files need a multipart copy in the Lambda.
+
+**Next:** ✅ [Verify the migration](#verify-the-migration-any-approach) with `<PREFIX>` = `stepfn`.
 
 ---
 
@@ -205,13 +218,23 @@ tripdata,202609-citibike-tripdata.zip,,succeeded,200,,Successful
 - ➖ You can't control parallelism or retries. "Complete" ≠ all copied — always read the report.
 - ⚠️ Copy jobs handle files **up to 5 GB** each — larger files need a Batch Ops job that invokes a Lambda.
 
+**Next:** ✅ [Verify the migration](#verify-the-migration-any-approach) with `<PREFIX>` = `batchops`.
+
 ---
 
-## Verify the copy (any approach)
+## Verify the migration (any approach)
 
+Run these after **any** approach to prove the copy is complete — nothing missing, no wrong sizes, no extras. Set `<PREFIX>` to `sync` (approach 1), `stepfn` (approach 2) or `batchops` (approach 3).
+
+**Expected:** the source holds **10 files, 6,584,519,507 bytes** — check it yourself:
 ```bash
-# Count and total size — expect 10 objects, 6584519507 bytes
-aws s3 ls s3://<BUCKET_NAME>/raw/citibike/<sync|stepfn|batchops>/ --recursive --summarize --profile runner
+aws s3api list-objects-v2 --bucket tripdata --region us-east-1 --query "[length(Contents[?starts_with(Key,'2026')]), sum(Contents[?starts_with(Key,'2026')].Size)]" --profile runner
+```
+
+**Check 1 — count and total size:**
+```bash
+# Expect Total Objects: 10 and Total Size: 6584519507
+aws s3 ls s3://<BUCKET_NAME>/raw/citibike/<PREFIX>/ --recursive --summarize --profile runner
 ```
 Output (our run, `stepfn` prefix, trimmed):
 ```text
@@ -222,11 +245,19 @@ Output (our run, `stepfn` prefix, trimmed):
 Total Objects: 10
    Total Size: 6584519507
 ```
+The same 10 files in the S3 console (`stepfn/` prefix):
+
+![Migrated files in S3](migrated_files.png)
+
+**Check 2 — file by file:** the same `sync` command, in report-only mode. It compares each file in the destination with the source and **prints only what it would fix** — then does nothing (`--dryrun`):
+- `(dryrun) copy:` → that file is **missing**, or its **size differs** from the source (`--size-only`)
+- `(dryrun) delete:` → an **extra** file the source doesn't have (`--delete`)
+- **no output** → nothing to fix: every file is there, at the right size, with no extras ✅
+
 ```bash
-# File-by-file check — NO output means every file is there at the right size, with no extras
-aws s3 sync s3://tripdata/ s3://<BUCKET_NAME>/raw/citibike/<sync|stepfn|batchops>/ --exclude "*" --include "2026*-citibike-tripdata.zip" --source-region us-east-1 --region ap-south-1 --size-only --delete --dryrun --profile runner
+aws s3 sync s3://tripdata/ s3://<BUCKET_NAME>/raw/citibike/<PREFIX>/ --exclude "*" --include "2026*-citibike-tripdata.zip" --source-region us-east-1 --region ap-south-1 --size-only --delete --dryrun --profile runner
 ```
-All three approaches passed both checks.
+Our run: **no output** for all three approaches — both checks passed.
 
 ## Clean up
 
