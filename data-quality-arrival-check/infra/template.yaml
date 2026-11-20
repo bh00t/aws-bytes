@@ -1,0 +1,782 @@
+# =============================================================================
+# template.yaml - AWS Bytes · Data Quality Check (stack aws-bytes-dq-arrival-check)
+#
+# What this stack builds (one region, ap-south-1):
+#   LAND   Step Functions "aws-bytes-dq-land" runs the Lander Lambda once per month
+#          -> TLC file streamed from CloudFront into raw/ + Glue partition registered
+#   CHECK  S3 "Object Created" under raw/nyc-taxi/ -> EventBridge rule -> Lambda checker
+#          Tier 1 (file, from the Parquet footer) + Tier 2 (rows) -> outputs in this path's folders:
+#            passed              -> validated/footer/   (copy of the raw file)
+#            passed_with_rejects -> validated/footer/   (valid rows) + rejected/footer/ (rejected rows + dq_reasons)
+#            quarantined         -> quarantine/footer/  (copy of the raw file)
+#          + one row in the DynamoDB file log
+#   MEASURE Step Functions "aws-bytes-dq-compare" runs the checker over every landed file
+#          (same checks, same outputs, file-log SK footer#compare)
+#   ALERT  every quarantined file is logged alert_status = pending (live path and measuring run);
+#          EventBridge Scheduler (every 15 min) -> alert notifier Lambda -> ONE SNS email -> rows marked "sent"
+#   RUN    IAM role poc-dq-runner = the only identity used to start runs and read results
+#
+# Files: infra/template.yaml (this file); lander_lambda.py, footer_checker_lambda.py, runbook.ps1
+#        in the PoC folder above it. Code: paths below are relative to this file, hence ../
+# No input files: the land run works out its own month list, the measure run lists S3 itself.
+#
+# Deploy: "aws cloudformation package" zips each .py file named under Code: and uploads it
+#         to the deploy bucket, then "aws cloudformation deploy" creates the stack (runbook.ps1).
+# Not in this stack yet: the Glue Data Quality service role - added when the Glue paths are built.
+# =============================================================================
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AWS Bytes Data Quality Check - TLC Yellow landing + Lambda checker (Tier 1 + Tier 2) + file log + email alerts
+
+Parameters:
+  # Public SSM parameter published by the AWS SDK for pandas team -> pinned layer ARN.
+  # 3.18.0 = AWSSDKPandas-Python312-Arm64:32 in ap-south-1 (checked 17-Nov). Gives pyarrow.
+  PandasLayerArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /aws/service/aws-sdk-pandas/3.18.0/py3.12/arm64/layer-arn
+  # IAM user allowed to assume the runner role (CLI profile "dqrunner" uses it as source)
+  RunnerTrustedUser:
+    Type: String
+    Default: poc-cli
+  # Where the data-quality alert emails go (SNS sends one confirmation link to it after the deploy)
+  AlertEmail:
+    Type: String
+    AllowedPattern: ".+@.+"
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # STORAGE - one lake bucket; zones are prefixes: raw/ validated/ quarantine/
+  # ---------------------------------------------------------------------------
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aws-bytes-lake-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:                         # SSE-S3: no KMS permissions needed anywhere
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:           # the bucket can never become public
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:                # send every object event to EventBridge;
+        EventBridgeConfiguration:               # the rule below picks only raw/nyc-taxi/
+          EventBridgeEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # GLUE DATA CATALOG - database + table over raw/ (the contract schema)
+  # ---------------------------------------------------------------------------
+  LakeDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: aws_bytes_lake
+        Description: AWS Bytes lake - tables over the lake bucket
+
+  # THE DATA CONTRACT (one reference for every checker path): the Glue table yellow_raw =
+  # the feed's original schema (the 2019 files), exact types. Any file whose schema differs
+  # (type, spelling, missing column) is quarantined; a new column passes with a note.
+  # The footer checker reads it on every call; the Glue paths check against it too.
+  # Partitions (year, month) are added by the Lander.
+  YellowRawTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LakeDatabase
+      TableInput:
+        Name: yellow_raw
+        Description: TLC Yellow trips as landed (raw zone) - data contract (2019 schema, exact types)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          dq.type_match: exact          # documents the rule; the Lambda checker always compares types exactly
+          # original spellings in the 2019 files (Glue stores names in lower case)
+          dq.known_spellings: VendorID,RatecodeID,PULocationID,DOLocationID,airport_fee
+        PartitionKeys:
+          - { Name: year,  Type: string }
+          - { Name: month, Type: string }
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/raw/nyc-taxi/yellow/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:                      # exactly the 19 columns and types of the 2019 files
+            - { Name: vendorid,              Type: bigint }
+            - { Name: tpep_pickup_datetime,  Type: timestamp }
+            - { Name: tpep_dropoff_datetime, Type: timestamp }
+            - { Name: passenger_count,       Type: double }
+            - { Name: trip_distance,         Type: double }
+            - { Name: ratecodeid,            Type: double }
+            - { Name: store_and_fwd_flag,    Type: string }
+            - { Name: pulocationid,          Type: bigint }
+            - { Name: dolocationid,          Type: bigint }
+            - { Name: payment_type,          Type: bigint }
+            - { Name: fare_amount,           Type: double }
+            - { Name: extra,                 Type: double }
+            - { Name: mta_tax,               Type: double }
+            - { Name: tip_amount,            Type: double }
+            - { Name: tolls_amount,          Type: double }
+            - { Name: improvement_surcharge, Type: double }
+            - { Name: total_amount,          Type: double }
+            - { Name: congestion_surcharge,  Type: double }
+            - { Name: airport_fee,           Type: double }
+
+  # ---------------------------------------------------------------------------
+  # FILE LOG - one row per file per checker (PK file, SK checker)
+  #   SK "footer" = live path, "footer#compare" = measure runs
+  # ---------------------------------------------------------------------------
+  FileLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: aws-bytes-dq-file-log
+      BillingMode: PAY_PER_REQUEST              # ~100 rows: pay per request, no capacity to size
+      AttributeDefinitions:
+        - { AttributeName: file,    AttributeType: S }
+        - { AttributeName: checker, AttributeType: S }
+      KeySchema:
+        - { AttributeName: file,    KeyType: HASH }
+        - { AttributeName: checker, KeyType: RANGE }
+
+  # ---------------------------------------------------------------------------
+  # LOG GROUPS - created by the stack so deleting the stack deletes the logs too
+  # ---------------------------------------------------------------------------
+  LanderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/aws-bytes-dq-lander
+      RetentionInDays: 14
+
+  FooterCheckerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/aws-bytes-dq-footer-checker
+      RetentionInDays: 14
+
+  AlertNotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/aws-bytes-dq-alert-notifier
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------------------
+  # LANDER - Lambda that lands one month (CloudFront -> raw/) + registers the partition
+  # ---------------------------------------------------------------------------
+  LanderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-bytes-dq-lander-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: lander
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: OwnLogs                    # write its own log streams only
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt LanderLogGroup.Arn
+              - Sid: WriteRaw                   # PutObject also covers multipart create/upload/complete
+                Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload]
+                Resource: !Sub ${LakeBucket.Arn}/raw/nyc-taxi/yellow/*
+              - Sid: ReadRaw                    # HeadObject on our copy (skip-if-unchanged + size check)
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${LakeBucket.Arn}/raw/*
+              - Sid: ListForNotFound            # without ListBucket a missing key returns 403, not 404
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt LakeBucket.Arn
+              - Sid: RegisterPartition          # read the table's storage settings, add year=/month=
+                Effect: Allow
+                Action: [glue:GetTable, glue:CreatePartition]
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/aws_bytes_lake
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/aws_bytes_lake/yellow_raw
+
+  LanderFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LanderLogGroup                   # log group exists before the first run
+    Properties:
+      FunctionName: aws-bytes-dq-lander
+      Description: Lands one TLC Yellow month from CloudFront into raw/ and registers its partition
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lander_lambda.handler
+      Code: ../lander_lambda.py                 # "package" zips this one file (path is relative to infra/)
+      MemorySize: 512                           # streaming upload: memory holds only 8 MiB parts
+      Timeout: 300                              # largest month (~130 MB) lands in seconds; 5 min headroom
+      Role: !GetAtt LanderRole.Arn
+      Environment:
+        Variables:
+          LAKE_BUCKET: !Ref LakeBucket
+          GLUE_DATABASE: aws_bytes_lake
+          GLUE_TABLE: yellow_raw
+
+  # ---------------------------------------------------------------------------
+  # LAND RUN - Step Functions: Map over months (at most 5 at a time) -> Lander
+  # ---------------------------------------------------------------------------
+  LandStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-bytes-dq-land-sfn-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-lander
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt LanderFunction.Arn
+
+  LandStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: aws-bytes-dq-land
+      RoleArn: !GetAtt LandStateMachineRole.Arn
+      DefinitionSubstitutions:
+        LanderArn: !GetAtt LanderFunction.Arn
+      Definition:
+        Comment: Land TLC Yellow months into raw/. No input = 2019-01 up to the month the run starts.
+        QueryLanguage: JSONata
+        StartAt: LandMonths
+        States:
+          LandMonths:
+            Type: Map
+            # Builds the month list itself, so no input file is needed:
+            #   from = input "from" or 2019-01;  to = input "to" or the run's own start month
+            #   each month -> a number (year*12 + month-1), range from..to, back to "YYYY-MM"
+            #   outer [ ] keeps it a list even for a single month
+            Items: >-
+              {% (
+                $from := $exists($states.input.from) ? $states.input.from : '2019-01';
+                $to := $exists($states.input.to) ? $states.input.to : $substring($states.context.Execution.StartTime, 0, 7);
+                $n := function($m) { $number($substring($m, 0, 4)) * 12 + $number($substring($m, 5, 2)) - 1 };
+                [$map([$n($from)..$n($to)], function($i) { $string($floor($i / 12)) & '-' & $pad($string($i % 12 + 1), -2, '0') })]
+              ) %}
+            MaxConcurrency: 5                           # account Lambda concurrency is 10
+            ItemProcessor:
+              ProcessorConfig: { Mode: INLINE }
+              StartAt: LandOneMonth
+              States:
+                LandOneMonth:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Arguments:
+                    FunctionName: ${LanderArn}
+                    Payload:
+                      month: "{% $states.input %}"
+                  Output: "{% $states.result.Payload %}"   # keep only the Lander's answer
+                  Retry:
+                    - ErrorEquals:                        # Lambda busy / throttled: back off
+                        - Lambda.TooManyRequestsException
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                      IntervalSeconds: 2
+                      MaxAttempts: 6
+                      BackoffRate: 2
+                    - ErrorEquals: [States.ALL]           # anything else: two more tries
+                      IntervalSeconds: 10
+                      MaxAttempts: 2
+                      BackoffRate: 1
+                  Catch:                                  # still failing: record it, keep the run going
+                    - ErrorEquals: [States.ALL]
+                      Output: "{% {'month': $states.input, 'status': 'error', 'error': $states.errorOutput.Error, 'cause': $states.errorOutput.Cause} %}"
+                      Next: MonthFailed
+                  End: true
+                MonthFailed:
+                  Type: Pass                              # passes the error record through
+                  End: true
+            Next: Summarise
+          Summarise:
+            Type: Pass
+            Output: >-
+              {% (
+                $r := $states.input;
+                {
+                  'months': $count($r),
+                  'landed': $count($r[status = 'landed']),
+                  'relanded': $count($r[status = 'relanded']),
+                  'skipped_unchanged': $count($r[status = 'skipped_unchanged']),
+                  'not_available': $count($r[status = 'not_available']),
+                  'size_mismatch': $count($r[status = 'size_mismatch']),
+                  'errors': $count($r[status = 'error']),
+                  'bytes': $sum($r.bytes),
+                  'problems': $r[status in ['error', 'size_mismatch']][]
+                }
+              ) %}
+            Next: AnyProblems
+          AnyProblems:
+            Type: Choice
+            Choices:
+              - Condition: "{% $states.input.errors > 0 or $states.input.size_mismatch > 0 %}"
+                Next: LandFailed
+            Default: Done
+          LandFailed:
+            Type: Fail                                    # execution shows FAILED with the bad months
+            Error: LandProblems
+            Cause: "{% $string($states.input.problems) %}"
+          Done:
+            Type: Succeed
+
+  # ---------------------------------------------------------------------------
+  # LAMBDA CHECKER - Tier 1 from the footer + S3 metadata, Tier 2 on the rows (function name kept: footer-checker)
+  # ---------------------------------------------------------------------------
+  FooterCheckerFailedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: aws-bytes-dq-footer-checker-failed
+      MessageRetentionPeriod: 1209600           # 14 days to look at events that never got checked
+
+  FooterCheckerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-bytes-dq-footer-checker-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: footer-checker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: OwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt FooterCheckerLogGroup.Arn
+              - Sid: ReadRaw                    # HeadObject + footer range GETs (Tier 1), whole file (Tier 2), CopyObject source
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${LakeBucket.Arn}/raw/*
+              - Sid: WriteZones                 # write this path's outputs + delete a stale copy left by an earlier result
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource:
+                  - !Sub ${LakeBucket.Arn}/validated/footer/*     # this checker's folders only
+                  - !Sub ${LakeBucket.Arn}/rejected/footer/*
+                  - !Sub ${LakeBucket.Arn}/quarantine/footer/*
+              - Sid: ReadContract               # the contract = columns + dq.* parameters of yellow_raw
+                Effect: Allow
+                Action: glue:GetTable
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/aws_bytes_lake
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/aws_bytes_lake/yellow_raw
+              - Sid: FileLog                    # write result rows, count duplicates, mark copied
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt FileLogTable.Arn
+              - Sid: FailedEvents               # async on-failure destination
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt FooterCheckerFailedQueue.Arn
+
+  FooterCheckerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FooterCheckerLogGroup
+    Properties:
+      FunctionName: aws-bytes-dq-footer-checker
+      Description: Tier 1 file checks from the Parquet footer + Tier 2 row checks; splits valid and rejected rows
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: footer_checker_lambda.handler
+      Code: ../footer_checker_lambda.py         # "package" zips this one file (path is relative to infra/)
+      Layers: [!Ref PandasLayerArn]             # pyarrow comes from the managed layer
+      MemorySize: 2048                          # Tier 2 reads rows: measured peak ~670 MB on a 7.9M-row, 292 MB test file
+                                                # (more memory also gives the function more CPU)
+      EphemeralStorage:
+        Size: 2048                              # /tmp holds the raw file + valid + rejected outputs (~2x the file)
+      Timeout: 300                              # Tier 2 on the largest month: seconds; 5 min headroom
+      Role: !GetAtt FooterCheckerRole.Arn
+      Environment:
+        Variables:
+          FILE_LOG_TABLE: !Ref FileLogTable
+          GLUE_DATABASE: aws_bytes_lake         # where the contract lives
+          GLUE_TABLE: yellow_raw
+
+  # Async invokes (from EventBridge): 2 retries, events kept up to 6 h, then sent to the queue
+  FooterCheckerAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref FooterCheckerFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 21600
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt FooterCheckerFailedQueue.Arn
+
+  # Live path: only new objects under raw/nyc-taxi/ (our validated/ quarantine/ copies never match)
+  RawObjectCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: aws-bytes-dq-raw-object-created
+      Description: raw/nyc-taxi/ Object Created -> footer checker
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref LakeBucket]
+          object:
+            key: [{ prefix: raw/nyc-taxi/ }]
+      Targets:
+        - Id: footer-checker
+          Arn: !GetAtt FooterCheckerFunction.Arn
+
+  # Lets EventBridge (this rule only) invoke the checker
+  RuleInvokeCheckerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FooterCheckerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RawObjectCreatedRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # ALERT - quarantined files (alert_status = pending in the file log) -> one email per alert-notifier run
+  # ---------------------------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aws-bytes-dq-alerts
+      DisplayName: AWS Bytes DQ
+
+  AlertEmailSubscription:                       # stays "PendingConfirmation" until the link in the email is clicked
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlertNotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-bytes-dq-alert-notifier-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: alert-notifier
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: OwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt AlertNotifierLogGroup.Arn
+              - Sid: ReadAndMarkFileLog         # find pending rows, set them to "sent"
+                Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:UpdateItem]
+                Resource: !GetAtt FileLogTable.Arn
+              - Sid: SendEmail
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  AlertNotifierFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AlertNotifierLogGroup
+    Properties:
+      FunctionName: aws-bytes-dq-alert-notifier
+      Description: Emails every quarantined file (alert_status = pending) in one SNS message, then marks them sent
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: alert_notifier_lambda.handler
+      Code: ../alert_notifier_lambda.py                 # "package" zips this one file (path is relative to infra/)
+      MemorySize: 128                           # a scan of ~100 rows + one publish
+      Timeout: 60
+      Role: !GetAtt AlertNotifierRole.Arn
+      Environment:
+        Variables:
+          FILE_LOG_TABLE: !Ref FileLogTable
+          TOPIC_ARN: !Ref AlertTopic
+
+  # EventBridge Scheduler needs its own role to invoke the alert notifier
+  AlertNotifierSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-bytes-dq-alert-notifier-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-alert-notifier
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AlertNotifierFunction.Arn
+
+  AlertNotifierSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: aws-bytes-dq-alert-notifier-every-15-min
+      Description: Runs the alert notifier every 15 minutes (no pending rows = no email)
+      ScheduleExpression: rate(15 minutes)
+      FlexibleTimeWindow:
+        Mode: "OFF"                             # quoted: bare OFF is read as false by YAML
+      State: ENABLED
+      Target:
+        Arn: !GetAtt AlertNotifierFunction.Arn
+        RoleArn: !GetAtt AlertNotifierSchedulerRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # MEASURING RUN - Step Functions: checker over every landed file (log row SK footer#compare + outputs)
+  # ---------------------------------------------------------------------------
+  CompareStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-bytes-dq-compare-sfn-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-checker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeChecker
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt FooterCheckerFunction.Arn
+              - Sid: ListLandedFiles          # list keys under raw/nyc-taxi/ only
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt LakeBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: raw/nyc-taxi/*
+
+  CompareStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: aws-bytes-dq-compare
+      RoleArn: !GetAtt CompareStateMachineRole.Arn
+      DefinitionSubstitutions:
+        CheckerArn: !GetAtt FooterCheckerFunction.Arn
+        Bucket: !Ref LakeBucket
+      Definition:
+        Comment: Measuring run - Lambda checker (Tier 1 + Tier 2) over every landed file (log + outputs, no alerts). No input needed.
+        QueryLanguage: JSONata
+        StartAt: ListLandedFiles
+        States:
+          ListLandedFiles:
+            Type: Task
+            # S3 ListObjectsV2 straight from Step Functions (no Lambda): what is really landed.
+            # Optional input "prefix" (e.g. raw/nyc-taxi/yellow-planted/ for planted tests).
+            # One call returns up to 1,000 keys - enough for this feed (~100 files).
+            Resource: arn:aws:states:::aws-sdk:s3:listObjectsV2
+            Arguments:
+              Bucket: ${Bucket}
+              Prefix: "{% $exists($states.input.prefix) ? $states.input.prefix : 'raw/nyc-taxi/yellow/' %}"
+              MaxKeys: 1000
+            # keep only the .parquet keys, always as a list
+            Output: "{% [$states.result.Contents[$contains(Key, '.parquet')].Key] %}"
+            Next: CheckFiles
+          CheckFiles:
+            Type: Map
+            Items: "{% $states.input %}"                # one iteration per S3 key
+            MaxConcurrency: 5
+            ItemProcessor:
+              ProcessorConfig: { Mode: INLINE }
+              StartAt: CheckOneFile
+              States:
+                CheckOneFile:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Arguments:
+                    FunctionName: ${CheckerArn}
+                    Payload:
+                      bucket: ${Bucket}
+                      key: "{% $states.input %}"
+                      mode: compare
+                  # keep a short record per file (the full result is in the file log)
+                  Output: "{% $states.result.Payload.{'file': file, 'status': status, 'num_rows': num_rows, 'rows_rejected': rows_rejected, 'rejects_by_rule': rejects_by_rule, 'size_bytes': size_bytes, 'footer_bytes_read': footer_bytes_read, 'duration_ms': duration_ms, 'max_rss_mb': max_rss_mb, 'reasons': reasons} %}"
+                  Retry:
+                    - ErrorEquals:
+                        - Lambda.TooManyRequestsException
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                      IntervalSeconds: 2
+                      MaxAttempts: 6
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: [States.ALL]
+                      Output: "{% {'file': $states.input, 'status': 'error', 'error': $states.errorOutput.Error, 'cause': $states.errorOutput.Cause} %}"
+                      Next: FileFailed
+                  End: true
+                FileFailed:
+                  Type: Pass
+                  End: true
+            Next: Summarise
+          Summarise:
+            Type: Pass
+            Output: >-
+              {% (
+                $r := $states.input;
+                {
+                  'files': $count($r),
+                  'passed': $count($r[status = 'passed']),
+                  'passed_with_rejects': $count($r[status = 'passed_with_rejects']),
+                  'quarantined': $count($r[status = 'quarantined']),
+                  'errors': $count($r[status = 'error']),
+                  'rows': $sum($r.num_rows),
+                  'rows_rejected': $sum($r.rows_rejected),
+                  'rejected_negative_trip_duration': $sum($r.rejects_by_rule.negative_trip_duration),
+                  'rejected_pickup_outside_file_month': $sum($r.rejects_by_rule.pickup_outside_file_month),
+                  'bytes_in_files': $sum($r.size_bytes),
+                  'footer_bytes_read': $sum($r.footer_bytes_read),
+                  'max_duration_ms': $max($r.duration_ms),
+                  'max_rss_mb': $max($r.max_rss_mb),
+                  'error_files': $r[status = 'error'][]
+                }
+              ) %}
+            Next: AnyErrors
+          AnyErrors:
+            Type: Choice                                  # a run with errors must not show SUCCEEDED
+            Choices:
+              - Condition: "{% $states.input.errors > 0 %}"
+                Next: CompareFailed
+            Default: CompareDone
+          CompareFailed:
+            Type: Fail                                    # execution shows FAILED; Cause lists the error files
+            Error: CheckErrors
+            Cause: "{% $string($states.input.error_files) %}"
+          CompareDone:
+            Type: Succeed
+
+  # ---------------------------------------------------------------------------
+  # RUNNER ROLE - the only identity used to run things and read results
+  # ---------------------------------------------------------------------------
+  RunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: poc-dq-runner
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:user/${RunnerTrustedUser}" }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: runner
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartRuns                  # start the land run and the measure run
+                Effect: Allow
+                Action: states:StartExecution
+                Resource:
+                  - !Ref LandStateMachine
+                  - !Ref CompareStateMachine
+              - Sid: WatchRuns                  # read status/output/history of those runs
+                Effect: Allow
+                Action: [states:DescribeExecution, states:GetExecutionHistory, states:StopExecution]
+                Resource:
+                  - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:aws-bytes-dq-land:*
+                  - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:aws-bytes-dq-compare:*
+              - Sid: ListRuns
+                Effect: Allow
+                Action: states:ListExecutions
+                Resource:
+                  - !Ref LandStateMachine
+                  - !Ref CompareStateMachine
+              - Sid: ListLake                   # list the bucket (counts per zone)
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt LakeBucket.Arn
+              - Sid: ReadZones                  # HeadObject / download from every zone
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub ${LakeBucket.Arn}/raw/*
+                  - !Sub ${LakeBucket.Arn}/validated/*
+                  - !Sub ${LakeBucket.Arn}/rejected/*
+                  - !Sub ${LakeBucket.Arn}/quarantine/*
+              - Sid: PlantTests                 # the only place the runner may write: planted test files
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${LakeBucket.Arn}/raw/nyc-taxi/yellow-planted/*
+              - Sid: ReadFileLog
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:Scan, dynamodb:DescribeTable]
+                Resource: !GetAtt FileLogTable.Arn
+              - Sid: ReadFailedQueue            # see events the checker never processed
+                Effect: Allow
+                Action: [sqs:GetQueueAttributes, sqs:ReceiveMessage, sqs:GetQueueUrl]
+                Resource: !GetAtt FooterCheckerFailedQueue.Arn
+              - Sid: ReadCatalog                # see the table and its partitions
+                Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetPartitions, glue:GetTableVersions]
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/aws_bytes_lake
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/aws_bytes_lake/yellow_raw
+              - Sid: ReadLambdaLogs             # read the Lambdas' logs
+                Effect: Allow
+                Action: [logs:FilterLogEvents, logs:GetLogEvents, logs:DescribeLogStreams]
+                Resource:
+                  - !GetAtt LanderLogGroup.Arn
+                  - !GetAtt FooterCheckerLogGroup.Arn
+                  - !GetAtt AlertNotifierLogGroup.Arn
+              - Sid: RunAlertNotifierNow        # send the alert email now instead of waiting up to 15 min
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AlertNotifierFunction.Arn
+              - Sid: CheckEmailSubscription     # see whether the alert email was confirmed
+                Effect: Allow
+                Action: sns:ListSubscriptionsByTopic
+                Resource: !Ref AlertTopic
+
+Outputs:
+  BucketName:
+    Value: !Ref LakeBucket
+    Export: { Name: aws-bytes-lake-bucket-name }
+  BucketArn:
+    Value: !GetAtt LakeBucket.Arn
+    Export: { Name: aws-bytes-lake-bucket-arn }
+  GlueDatabaseName:
+    Value: !Ref LakeDatabase
+    Export: { Name: aws-bytes-lake-glue-database }
+  LandStateMachineArn:
+    Value: !Ref LandStateMachine
+  CompareStateMachineArn:
+    Value: !Ref CompareStateMachine
+  FileLogTableName:
+    Value: !Ref FileLogTable
+  RunnerRoleArn:
+    Value: !GetAtt RunnerRole.Arn
+  AlertTopicArn:
+    Value: !Ref AlertTopic

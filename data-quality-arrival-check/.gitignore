@@ -1,0 +1,8 @@
+# Temporary, kept local (final versions are merged into the committed files)
+runbook.ps1
+infra/glue-template.yaml
+# Lambda zips from local builds / cloudformation package
+*.zip
+# Python cache
+__pycache__/
+*.pyc
