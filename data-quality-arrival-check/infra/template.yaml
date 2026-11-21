@@ -4,28 +4,33 @@
 # What this stack builds (one region, ap-south-1):
 #   LAND   Step Functions "aws-bytes-dq-land" runs the Lander Lambda once per month
 #          -> TLC file streamed from CloudFront into raw/ + Glue partition registered
-#   CHECK  S3 "Object Created" under raw/nyc-taxi/ -> EventBridge rule -> Lambda checker
-#          Tier 1 (file, from the Parquet footer) + Tier 2 (rows) -> outputs in this path's folders:
-#            passed              -> validated/footer/   (copy of the raw file)
-#            passed_with_rejects -> validated/footer/   (valid rows) + rejected/footer/ (rejected rows + dq_reasons)
-#            quarantined         -> quarantine/footer/  (copy of the raw file)
-#          + one row in the DynamoDB file log
-#   MEASURE Step Functions "aws-bytes-dq-compare" runs the checker over every landed file
-#          (same checks, same outputs, file-log SK footer#compare)
-#   ALERT  every quarantined file is logged alert_status = pending (live path and measuring run);
-#          EventBridge Scheduler (every 15 min) -> alert notifier Lambda -> ONE SNS email -> rows marked "sent"
+#   Two approaches to the same data quality check (same files, contract, statuses, outputs, file log):
+#   CHECK - lambda approach
+#          S3 "Object Created" under raw/nyc-taxi/ -> EventBridge rule -> Lambda checker
+#          Tier 1 (file, from the Parquet footer) + Tier 2 (rows) -> outputs in this approach's folders:
+#            passed              -> validated/lambda/   (copy of the raw file)
+#            passed_with_rejects -> validated/lambda/   (valid rows) + rejected/lambda/ (rejected rows + dq_reasons)
+#            quarantined         -> quarantine/lambda/  (copy of the raw file)
+#          + one row in the DynamoDB file log (SK lambda = live path)
+#   MEASURE - lambda approach: Step Functions "aws-bytes-dq-compare" runs the Lambda checker over every
+#          landed file (same checks, same outputs, file-log SK lambda#compare)
+#   CHECK + MEASURE - glue-etl approach: Step Functions "aws-bytes-dq-compare-glue-etl" runs the Glue ETL
+#          job "aws-bytes-dq-glue-etl" once per landed file (file checks = Glue Data Quality native rules, own code only where none exists,
+#          row checks = Glue Data Quality row-level rules) -> validated|rejected|quarantine/glue-etl/
+#          + file-log SK glue-etl#compare. Measuring runs only (no live path).
+#   ALERT  every quarantined file and every file with rejected rows is logged alert_status = pending;
+#          EventBridge Scheduler (every 15 min) -> alert notifier Lambda -> ONE SNS email PER APPROACH -> rows marked "sent"
 #   RUN    IAM role poc-dq-runner = the only identity used to start runs and read results
 #
-# Files: infra/template.yaml (this file); lander_lambda.py, footer_checker_lambda.py, runbook.ps1
-#        in the PoC folder above it. Code: paths below are relative to this file, hence ../
-# No input files: the land run works out its own month list, the measure run lists S3 itself.
+# Files: infra/template.yaml (this file); lander_lambda.py, lambda_checker.py, alert_notifier_lambda.py,
+#        glue_etl_job.py, runbook.ps1 in the PoC folder above it. Code paths below are relative to this file, hence ../
+# No input files: the land run works out its own month list, the measuring runs list S3 themselves.
 #
-# Deploy: "aws cloudformation package" zips each .py file named under Code: and uploads it
-#         to the deploy bucket, then "aws cloudformation deploy" creates the stack (runbook.ps1).
-# Not in this stack yet: the Glue Data Quality service role - added when the Glue paths are built.
+# Deploy: "aws cloudformation package" zips each Lambda .py file named under Code:, uploads the Glue
+#         script as-is, then "aws cloudformation deploy" creates/updates the stack (runbook.ps1).
 # =============================================================================
 AWSTemplateFormatVersion: "2010-09-09"
-Description: AWS Bytes Data Quality Check - TLC Yellow landing + Lambda checker (Tier 1 + Tier 2) + file log + email alerts
+Description: AWS Bytes Data Quality Check - TLC Yellow landing + lambda and glue-etl checkers (Tier 1 + Tier 2) + file log + email alerts
 
 Parameters:
   # Public SSM parameter published by the AWS SDK for pandas team -> pinned layer ARN.
@@ -77,7 +82,7 @@ Resources:
   # THE DATA CONTRACT (one reference for every checker path): the Glue table yellow_raw =
   # the feed's original schema (the 2019 files), exact types. Any file whose schema differs
   # (type, spelling, missing column) is quarantined; a new column passes with a note.
-  # The footer checker reads it on every call; the Glue paths check against it too.
+  # The Lambda checker and the Glue ETL job read it on every run.
   # Partitions (year, month) are added by the Lander.
   YellowRawTable:
     Type: AWS::Glue::Table
@@ -125,7 +130,7 @@ Resources:
 
   # ---------------------------------------------------------------------------
   # FILE LOG - one row per file per checker (PK file, SK checker)
-  #   SK "footer" = live path, "footer#compare" = measure runs
+  #   SK "lambda" = live path, "lambda#compare" / "glue-etl#compare" = measuring runs
   # ---------------------------------------------------------------------------
   FileLogTable:
     Type: AWS::DynamoDB::Table
@@ -335,7 +340,9 @@ Resources:
             Type: Succeed
 
   # ---------------------------------------------------------------------------
-  # LAMBDA CHECKER - Tier 1 from the footer + S3 metadata, Tier 2 on the rows (function name kept: footer-checker)
+  # LAMBDA CHECKER (lambda approach) - Tier 1 from the footer + S3 metadata, Tier 2 on the rows
+  # AWS names keep "footer-checker" (function, role, log group, queue): renaming them would replace the
+  # function and delete its logs. The approach name in data is "lambda".
   # ---------------------------------------------------------------------------
   FooterCheckerFailedQueue:
     Type: AWS::SQS::Queue
@@ -366,13 +373,13 @@ Resources:
                 Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub ${LakeBucket.Arn}/raw/*
-              - Sid: WriteZones                 # write this path's outputs + delete a stale copy left by an earlier result
+              - Sid: WriteZones                 # write this approach's outputs + delete a stale copy left by an earlier result
                 Effect: Allow
                 Action: [s3:PutObject, s3:DeleteObject]
                 Resource:
-                  - !Sub ${LakeBucket.Arn}/validated/footer/*     # this checker's folders only
-                  - !Sub ${LakeBucket.Arn}/rejected/footer/*
-                  - !Sub ${LakeBucket.Arn}/quarantine/footer/*
+                  - !Sub ${LakeBucket.Arn}/validated/lambda/*     # this approach's folders only
+                  - !Sub ${LakeBucket.Arn}/rejected/lambda/*
+                  - !Sub ${LakeBucket.Arn}/quarantine/lambda/*
               - Sid: ReadContract               # the contract = columns + dq.* parameters of yellow_raw
                 Effect: Allow
                 Action: glue:GetTable
@@ -397,8 +404,8 @@ Resources:
       Description: Tier 1 file checks from the Parquet footer + Tier 2 row checks; splits valid and rejected rows
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: footer_checker_lambda.handler
-      Code: ../footer_checker_lambda.py         # "package" zips this one file (path is relative to infra/)
+      Handler: lambda_checker.handler
+      Code: ../lambda_checker.py                # "package" zips this one file (path is relative to infra/)
       Layers: [!Ref PandasLayerArn]             # pyarrow comes from the managed layer
       MemorySize: 2048                          # Tier 2 reads rows: measured peak ~670 MB on a 7.9M-row, 292 MB test file
                                                 # (more memory also gives the function more CPU)
@@ -429,7 +436,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: aws-bytes-dq-raw-object-created
-      Description: raw/nyc-taxi/ Object Created -> footer checker
+      Description: raw/nyc-taxi/ Object Created -> Lambda checker (lambda approach)
       EventPattern:
         source: [aws.s3]
         detail-type: [Object Created]
@@ -452,7 +459,7 @@ Resources:
       SourceArn: !GetAtt RawObjectCreatedRule.Arn
 
   # ---------------------------------------------------------------------------
-  # ALERT - quarantined files (alert_status = pending in the file log) -> one email per alert-notifier run
+  # ALERT - quarantined files + files with rejected rows (alert_status = pending) -> one email per approach per notifier run
   # ---------------------------------------------------------------------------
   AlertTopic:
     Type: AWS::SNS::Topic
@@ -500,7 +507,7 @@ Resources:
     DependsOn: AlertNotifierLogGroup
     Properties:
       FunctionName: aws-bytes-dq-alert-notifier
-      Description: Emails every quarantined file (alert_status = pending) in one SNS message, then marks them sent
+      Description: Emails pending file-log rows (quarantined or with rejected rows), one SNS message per approach, then marks them sent
       Runtime: python3.12
       Architectures: [arm64]
       Handler: alert_notifier_lambda.handler
@@ -549,7 +556,7 @@ Resources:
         RoleArn: !GetAtt AlertNotifierSchedulerRole.Arn
 
   # ---------------------------------------------------------------------------
-  # MEASURING RUN - Step Functions: checker over every landed file (log row SK footer#compare + outputs)
+  # MEASURING RUN (lambda approach) - Step Functions: Lambda checker over every landed file (SK lambda#compare + outputs)
   # ---------------------------------------------------------------------------
   CompareStateMachineRole:
     Type: AWS::IAM::Role
@@ -678,6 +685,274 @@ Resources:
             Type: Succeed
 
   # ---------------------------------------------------------------------------
+  # GLUE ETL CHECKER (glue-etl approach) - Glue job, one landed file per run
+  # ---------------------------------------------------------------------------
+  GlueEtlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-bytes-dq-glue-etl-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: glue-etl-checker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadScript                 # the job script uploaded by "cloudformation package"
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::aws-bytes-deploy-${AWS::AccountId}-${AWS::Region}/data-quality-arrival-check/*
+              - Sid: ListLake                   # Spark lists folders when it reads and writes
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt LakeBucket.Arn
+              - Sid: ReadRaw                    # HeadObject + Spark read of the landed file; CopyObject source
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${LakeBucket.Arn}/raw/*
+              - Sid: WriteOwnZones              # this approach's folders only + delete a stale copy
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource:
+                  - !Sub ${LakeBucket.Arn}/validated/glue-etl/*
+                  - !Sub ${LakeBucket.Arn}/rejected/glue-etl/*
+                  - !Sub ${LakeBucket.Arn}/quarantine/glue-etl/*
+              - Sid: Staging                    # Spark writes part files here; the job copies one out, deletes the rest
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+                Resource: !Sub ${LakeBucket.Arn}/_tmp/glue-etl/*
+              - Sid: ReadContract               # the contract = columns + dq.* parameters of yellow_raw
+                Effect: Allow
+                Action: glue:GetTable
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/aws_bytes_lake
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/aws_bytes_lake/yellow_raw
+              - Sid: PublishDqResults           # keep each evaluation's results in Glue (Data quality history)
+                Effect: Allow
+                Action: glue:PublishDataQuality
+                Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:dataQualityRuleset/*
+              - Sid: DqHistory                  # DetectAnomalies reads earlier results + its model (smoke 21-Nov: denied without this)
+                Effect: Allow
+                Action: [glue:GetDataQualityResult, glue:GetDataQualityModel, glue:GetDataQualityModelResult]
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:dataQualityRuleset/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/aws-bytes-dq-glue-etl
+              - Sid: DqLibrary                  # Glue Data Quality loads its library from this AWS bucket
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::aws-glue-ml-data-quality-assets-${AWS::Region}/*
+              - Sid: FileLog                    # write the result row, then mark it copied
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt FileLogTable.Arn
+              - Sid: JobLogs                    # Glue job logs (/aws-glue/jobs/...)
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*
+
+  GlueEtlJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: aws-bytes-dq-glue-etl
+      Description: File checks (Glue Data Quality native rules) and row checks (Glue Data Quality row-level rules) on one landed file
+      Role: !GetAtt GlueEtlRole.Arn
+      GlueVersion: "5.0"                        # Spark 3.5, Python 3.11
+      WorkerType: G.1X                          # 1 DPU per worker (4 vCPU, 16 GB)
+      NumberOfWorkers: 2                        # the minimum for a Spark job = billing floor 2 DPU
+      Timeout: 15                               # minutes; largest month is ~130 MB
+      MaxRetries: 0                             # a failed run shows as an error in the measuring run, no silent retry
+      ExecutionProperty:
+        MaxConcurrentRuns: 40                   # same cap as the measuring run's Map (40 x 2 DPU = 80 DPU at peak)
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: ../glue_etl_job.py      # "package" uploads this file as-is (path is relative to infra/)
+      DefaultArguments:
+        "--job-language": python
+        "--bucket": !Ref LakeBucket
+        "--file_log_table": !Ref FileLogTable
+        "--glue_database": aws_bytes_lake
+        "--glue_table": yellow_raw
+        "--file_key": none                      # always replaced by the measuring run (one file per run)
+
+  # ---------------------------------------------------------------------------
+  # MEASURING RUN (glue-etl approach) - Step Functions: the Glue job once per landed file (SK glue-etl#compare)
+  # ---------------------------------------------------------------------------
+  GlueEtlCompareRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-bytes-dq-compare-glue-etl-sfn-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: run-glue-etl
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunJob                     # startJobRun.sync = start, then poll until the run ends
+                Effect: Allow
+                Action: [glue:StartJobRun, glue:GetJobRun, glue:GetJobRuns, glue:BatchStopJobRun]
+                Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueEtlJob}
+              - Sid: ListLandedFiles            # list keys under raw/nyc-taxi/ only
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt LakeBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: raw/nyc-taxi/*
+              - Sid: StampAndReadResultRow      # write the real Glue run ID onto the job's row, read it back
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt FileLogTable.Arn
+
+  GlueEtlCompareStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: aws-bytes-dq-compare-glue-etl
+      RoleArn: !GetAtt GlueEtlCompareRole.Arn
+      DefinitionSubstitutions:
+        Bucket: !Ref LakeBucket
+        JobName: !Ref GlueEtlJob
+        FileLog: !Ref FileLogTable
+      Definition:
+        Comment: Measuring run - Glue ETL checker (Tier 1 + Tier 2) over every landed file (log + outputs). Optional input "prefix".
+        QueryLanguage: JSONata
+        StartAt: ListLandedFiles
+        States:
+          ListLandedFiles:
+            Type: Task
+            # Same listing as the lambda measuring run. Optional input "prefix", e.g.
+            # raw/nyc-taxi/yellow/year=2023/ (smoke test) or raw/nyc-taxi/yellow-planted/ (planted tests).
+            Resource: arn:aws:states:::aws-sdk:s3:listObjectsV2
+            Arguments:
+              Bucket: ${Bucket}
+              Prefix: "{% $exists($states.input.prefix) ? $states.input.prefix : 'raw/nyc-taxi/yellow/' %}"
+              MaxKeys: 1000
+            Output: "{% [$states.result.Contents[$contains(Key, '.parquet')].Key] %}"
+            Next: CheckFiles
+          CheckFiles:
+            Type: Map
+            Items: "{% $states.input %}"
+            MaxConcurrency: 40                    # the job allows 40 concurrent runs; 93 files = 3 rounds.
+                                                  # Concurrency changes wall time only: each run is billed on its own
+            ItemProcessor:
+              ProcessorConfig: { Mode: INLINE }
+              StartAt: RunJob
+              States:
+                RunJob:
+                  Type: Task
+                  Resource: arn:aws:states:::glue:startJobRun.sync     # start the job run and wait for it
+                  Arguments:
+                    JobName: ${JobName}
+                    Arguments:
+                      "--file_key": "{% $states.input %}"
+                  # keep the run's ID, state and run time (seconds, as Glue reports it)
+                  Output: "{% {'file': $states.input, 'job_run_id': $states.result.Id, 'job_state': $states.result.JobRunState, 'execution_s': $states.result.ExecutionTime} %}"
+                  Retry:
+                    - ErrorEquals: [Glue.ConcurrentRunsExceededException]   # another run still holding a slot
+                      IntervalSeconds: 30
+                      MaxAttempts: 6
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: [States.ALL]
+                      Output: "{% {'file': $states.input, 'status': 'error', 'error': $states.errorOutput.Error, 'cause': $states.errorOutput.Cause} %}"
+                      Next: FileFailed
+                  Next: StampRunId
+                StampRunId:
+                  Type: Task
+                  # the job wrote one row for this file: stamp the Glue run ID + Glue's run time on it
+                  # (from Glue's own answer above) and read the row back in the same call.
+                  # attribute_exists: if the job wrote no row, this fails -> the file counts as an error.
+                  Resource: arn:aws:states:::dynamodb:updateItem
+                  Arguments:
+                    TableName: ${FileLog}
+                    Key:
+                      file: { S: "{% $states.input.file %}" }
+                      checker: { S: glue-etl#compare }
+                    UpdateExpression: SET run_id = :r, job_execution_s = :e
+                    ConditionExpression: attribute_exists(#f)
+                    ExpressionAttributeNames: { "#f": file }
+                    ExpressionAttributeValues:
+                      ":r": { S: "{% $states.input.job_run_id %}" }
+                      ":e": { N: "{% $string($states.input.execution_s) %}" }
+                    ReturnValues: ALL_NEW
+                  Output: >-
+                    {% (
+                      $i := $states.result.Attributes;
+                      $num := function($v) { $exists($v) ? $number($v) : 0 };
+                      {
+                        'file': $states.input.file,
+                        'job_run_id': $states.input.job_run_id,
+                        'execution_s': $states.input.execution_s,
+                        'status': $exists($i) ? $i.status.S : 'error',
+                        'num_rows': $num($i.num_rows.N),
+                        'rows_rejected': $num($i.rows_rejected.N),
+                        'negative_trip_duration': $num($i.rejects_by_rule.M.negative_trip_duration.N),
+                        'pickup_outside_file_month': $num($i.rejects_by_rule.M.pickup_outside_file_month.N),
+                        'size_bytes': $num($i.size_bytes.N),
+                        'duration_ms': $num($i.duration_ms.N)
+                      }
+                    ) %}
+                  Catch:
+                    - ErrorEquals: [States.ALL]
+                      Output: "{% {'file': $states.input.file, 'status': 'error', 'error': $states.errorOutput.Error, 'cause': $states.errorOutput.Cause} %}"
+                      Next: FileFailed
+                  End: true
+                FileFailed:
+                  Type: Pass
+                  End: true
+            Next: Summarise
+          Summarise:
+            Type: Pass
+            # billed DPU-hours: each run is billed per second with a 1-minute minimum, 2 DPU (2 workers x G.1X)
+            Output: >-
+              {% (
+                $r := $states.input;
+                $ok := $r[status != 'error'];
+                {
+                  'files': $count($r),
+                  'passed': $count($r[status = 'passed']),
+                  'passed_with_rejects': $count($r[status = 'passed_with_rejects']),
+                  'quarantined': $count($r[status = 'quarantined']),
+                  'errors': $count($r[status = 'error']),
+                  'rows': $sum($r.num_rows),
+                  'rows_rejected': $sum($r.rows_rejected),
+                  'rejected_negative_trip_duration': $sum($r.negative_trip_duration),
+                  'rejected_pickup_outside_file_month': $sum($r.pickup_outside_file_month),
+                  'bytes_in_files': $sum($r.size_bytes),
+                  'job_execution_s_total': $sum($ok.execution_s),
+                  'job_execution_s_max': $max($ok.execution_s),
+                  'in_job_duration_ms_max': $max($ok.duration_ms),
+                  'billed_dpu_hours': $round($sum($map($ok.execution_s, function($s) { $s < 60 ? 60 : $s })) * 2 / 3600, 4),
+                  'error_files': $r[status = 'error'][]
+                }
+              ) %}
+            Next: AnyErrors
+          AnyErrors:
+            Type: Choice                          # a run with errors must not show SUCCEEDED
+            Choices:
+              - Condition: "{% $states.input.errors > 0 %}"
+                Next: CompareFailed
+            Default: CompareDone
+          CompareFailed:
+            Type: Fail
+            Error: CheckErrors
+            Cause: "{% $string($states.input.error_files) %}"
+          CompareDone:
+            Type: Succeed
+
+  # ---------------------------------------------------------------------------
   # RUNNER ROLE - the only identity used to run things and read results
   # ---------------------------------------------------------------------------
   RunnerRole:
@@ -695,24 +970,31 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: StartRuns                  # start the land run and the measure run
+              - Sid: StartRuns                  # start the land run and both measuring runs
                 Effect: Allow
                 Action: states:StartExecution
                 Resource:
                   - !Ref LandStateMachine
                   - !Ref CompareStateMachine
+                  - !Ref GlueEtlCompareStateMachine
               - Sid: WatchRuns                  # read status/output/history of those runs
                 Effect: Allow
                 Action: [states:DescribeExecution, states:GetExecutionHistory, states:StopExecution]
                 Resource:
                   - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:aws-bytes-dq-land:*
                   - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:aws-bytes-dq-compare:*
+                  - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:aws-bytes-dq-compare-glue-etl:*
               - Sid: ListRuns
                 Effect: Allow
                 Action: states:ListExecutions
                 Resource:
                   - !Ref LandStateMachine
                   - !Ref CompareStateMachine
+                  - !Ref GlueEtlCompareStateMachine
+              - Sid: WatchGlueJobRuns           # Glue job run details (time, DPU, errors)
+                Effect: Allow
+                Action: [glue:GetJobRun, glue:GetJobRuns]
+                Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueEtlJob}
               - Sid: ListLake                   # list the bucket (counts per zone)
                 Effect: Allow
                 Action: s3:ListBucket
@@ -744,13 +1026,14 @@ Resources:
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/aws_bytes_lake
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/aws_bytes_lake/yellow_raw
-              - Sid: ReadLambdaLogs             # read the Lambdas' logs
+              - Sid: ReadLogs                   # read the Lambdas' logs and the Glue job's logs
                 Effect: Allow
                 Action: [logs:FilterLogEvents, logs:GetLogEvents, logs:DescribeLogStreams]
                 Resource:
                   - !GetAtt LanderLogGroup.Arn
                   - !GetAtt FooterCheckerLogGroup.Arn
                   - !GetAtt AlertNotifierLogGroup.Arn
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*
               - Sid: RunAlertNotifierNow        # send the alert email now instead of waiting up to 15 min
                 Effect: Allow
                 Action: lambda:InvokeFunction
@@ -774,6 +1057,10 @@ Outputs:
     Value: !Ref LandStateMachine
   CompareStateMachineArn:
     Value: !Ref CompareStateMachine
+  GlueEtlCompareStateMachineArn:
+    Value: !Ref GlueEtlCompareStateMachine
+  GlueEtlJobName:
+    Value: !Ref GlueEtlJob
   FileLogTableName:
     Value: !Ref FileLogTable
   RunnerRoleArn:

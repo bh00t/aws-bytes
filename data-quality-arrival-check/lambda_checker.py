@@ -1,7 +1,8 @@
 """
-footer_checker_lambda.py - AWS Bytes · Data Quality Check · Lambda checker (Lambda aws-bytes-dq-footer-checker)
-(The name is kept from the first version, which read only the Parquet footer. The function now runs
- Tier 1 from the footer AND Tier 2 on the rows.)
+lambda_checker.py - AWS Bytes · Data Quality Check · lambda approach (Lambda function aws-bytes-dq-footer-checker)
+Approach name everywhere: "lambda" (S3 folders, file-log SK lambda / lambda#compare).
+(The AWS function keeps its first name, aws-bytes-dq-footer-checker: renaming it would replace the function
+ and delete its log group. Tier 1 reads the Parquet footer; Tier 2 reads the rows.)
 
 One landed TLC Yellow month per call. Two tiers of checks:
 
@@ -15,7 +16,7 @@ TIER 1 - FILE checks: "can this whole file be trusted?"
     6 column type differs from the contract (Glue table yellow_raw) -> quarantine
     7 new column not in the contract                                -> pass + note (never blocked)
     8 same file delivered twice (same S3 checksum, live path only)  -> skip
-  Recorded, no rule: num_rows, size, null counts, earliest/latest pickup (volume rule on hold).
+  Recorded, no rule: num_rows, size (volume rule on hold).
 
 TIER 2 - ROW checks: "which rows are wrong?"  Runs only when Tier 1 passed.
   Reads the file in batches of rows and checks each row:
@@ -24,16 +25,16 @@ TIER 2 - ROW checks: "which rows are wrong?"  Runs only when Tier 1 passed.
   A NULL time cannot be judged, so that rule does not reject the row.
   A rejected row keeps every original column plus dq_reasons, e.g. "negative_trip_duration;pickup_outside_file_month".
 
-Results and outputs (zone first, then this path's folder "footer"):
-  passed               -> validated/footer/...   server-side copy of the raw file, byte for byte
-  passed_with_rejects  -> validated/footer/...   valid rows only (a new Parquet file)
-                          rejected/footer/...    rejected rows + dq_reasons
-  quarantined          -> quarantine/footer/...  server-side copy of the raw file (Tier 2 not run)
+Results and outputs (zone first, then this approach's folder "lambda"):
+  passed               -> validated/lambda/...   server-side copy of the raw file, byte for byte
+  passed_with_rejects  -> validated/lambda/...   valid rows only (a new Parquet file)
+                          rejected/lambda/...    rejected rows + dq_reasons
+  quarantined          -> quarantine/lambda/...  server-side copy of the raw file (Tier 2 not run)
   skipped_duplicate    -> nothing written (live path only)
   A copy left in another zone by an earlier result for the same file is deleted (re-published files).
 
 File log (DynamoDB aws-bytes-dq-file-log): one row per file per mode.
-  SK "footer" = live path (S3 event), SK "footer#compare" = measuring run (Step Functions aws-bytes-dq-compare).
+  SK "lambda" = live path (S3 event), SK "lambda#compare" = measuring run (Step Functions aws-bytes-dq-compare).
   alert_status = "pending" for every quarantined file and every file with rejected rows (live path and
   measuring run), else "not_needed";
   the alert notifier Lambda (alert_notifier_lambda.py) emails pending rows and sets them to "sent".
@@ -69,7 +70,7 @@ import pyarrow.parquet as pq
 s3 = boto3.client("s3")
 glue = boto3.client("glue")
 
-PATH_NAME = "footer"                       # this path's folder under each zone + file-log SK
+PATH_NAME = "lambda"                       # this approach's folder under each zone + file-log SK
 ZONES = ("validated", "rejected", "quarantine")
 PICKUP, DROPOFF = "tpep_pickup_datetime", "tpep_dropoff_datetime"
 TMP = "/tmp"                               # Lambda ephemeral storage (size set in template.yaml)
@@ -191,28 +192,6 @@ def check_schema(md, reasons, notes, c):
             reasons.append(f"missing required column {col}")
 
 
-def column_stats(md):
-    """Recorded only: null count per column (summed over row groups) + earliest/latest pickup.
-    None = the file wrote no statistics for that column (e.g. 18 months 2023-02 -> 2024-07)."""
-    out, pick = {}, None
-    for i in range(md.num_columns):
-        name = md.schema.column(i).name
-        nulls, lo, hi = 0, None, None
-        for rg in range(md.num_row_groups):
-            st = md.row_group(rg).column(i).statistics
-            if st is None or st.null_count is None:
-                nulls = None
-            elif nulls is not None:
-                nulls += st.null_count
-            if name.lower() == PICKUP and st is not None and st.has_min_max:
-                lo = st.min if lo is None else min(lo, st.min)
-                hi = st.max if hi is None else max(hi, st.max)
-        out[name.lower()] = nulls
-        if name.lower() == PICKUP:
-            pick = (lo, hi)
-    return out, pick
-
-
 def tier1(bucket, key):
     """Runs Tier 1 for one object. Returns the result dict (status passed / quarantined), no writes."""
     h = head(bucket, key)
@@ -223,7 +202,6 @@ def tier1(bucket, key):
         "checksum": h["checksum"],
         "landed_at": h["landed_at"],
         "source_url": h["meta"].get("source-url"),
-        "source_etag": h["meta"].get("source-etag"),
         "reasons": reasons,
         "notes": notes,
     }
@@ -240,16 +218,12 @@ def tier1(bucket, key):
         reasons.append(f"not readable Parquet: {e}")
         res.update(status="quarantined", footer_bytes_read=None)
         return res
-    res.update(num_rows=md.num_rows, num_row_groups=md.num_row_groups,
-               footer_bytes_read=read, created_by=md.created_by)
+    res.update(num_rows=md.num_rows, footer_bytes_read=read)
     if sum(md.row_group(i).num_rows for i in range(md.num_row_groups)) != md.num_rows:
         reasons.append("row groups do not add up to footer num_rows")      # check 1 (consistency)
     if md.num_rows == 0:                                                     # check 3
         reasons.append("0 rows")
     check_schema(md, reasons, notes, load_contract())                        # checks 4-7
-    res["null_counts"], (lo, hi) = column_stats(md)                          # recorded only
-    if lo is not None:
-        res["pickup_min"], res["pickup_max"] = lo.isoformat(), hi.isoformat()
     res["status"] = "quarantined" if reasons else "passed"
     return res
 
@@ -365,7 +339,7 @@ def check_file(bucket, key, write, gate=None):
 # Writes: zone outputs (S3) + file log (DynamoDB)
 # ---------------------------------------------------------------------------
 def zone_key(zone, key):
-    """raw/nyc-taxi/... -> validated/footer/nyc-taxi/... (zone first, then this checker's folder)."""
+    """raw/nyc-taxi/... -> validated/lambda/nyc-taxi/... (zone first, then this approach's folder)."""
     return f"{zone}/{PATH_NAME}/" + key.split("/", 1)[1]
 
 
@@ -483,7 +457,7 @@ def handler(event, context=None):
 
 
 if __name__ == "__main__":
-    # Laptop dry run as the runner role:  python footer_checker_lambda.py BUCKET KEY
+    # Laptop dry run as the runner role:  python lambda_checker.py BUCKET KEY
     # (set GLUE_DATABASE=aws_bytes_lake and GLUE_TABLE=yellow_raw first: the contract is read from Glue;
     #  set TMP_DIR if /tmp does not exist, e.g. on Windows)
     import json
