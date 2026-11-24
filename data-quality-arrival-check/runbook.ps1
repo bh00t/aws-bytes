@@ -45,16 +45,16 @@ $alertEmail = Read-Host "Alert email address"
 Set-Location C:\Users\risha\Desktop\Code\repo\aws-bytes\data-quality-arrival-check
 
 # Lambda checker under its new file name, approach folder "lambda": expect 1 line
-Select-String -Path .\lambda_checker.py -Pattern 'PATH_NAME = "lambda"'
+Select-String -Path .\lambda\lambda_checker.py -Pattern 'PATH_NAME = "lambda"'
 
 # Glue job script in place: expect 1 line
-Select-String -Path .\glue_etl_job.py -Pattern 'APPROACH = "glue-etl"'
+Select-String -Path .\glue\glue_etl_job.py -Pattern 'APPROACH = "glue-etl"'
 
 # Glue script is v5 (native Glue DQ rules): expect 2 lines (the docstring and the rule)
-Select-String -Path .\glue_etl_job.py -Pattern 'SchemaMatch "contract" = 1.0'
+Select-String -Path .\glue\glue_etl_job.py -Pattern 'SchemaMatch "contract" = 1.0'
 
 # Template has both approaches: expect 2 lines (the Lambda handler, the Glue script)
-Select-String -Path .\infra\template.yaml -Pattern "Handler: lambda_checker.handler", "ScriptLocation: ../glue_etl_job.py"
+Select-String -Path .\infra\template.yaml -Pattern "Handler: lambda_checker.handler", "ScriptLocation: ../glue/glue_etl_job.py"
 
 # The old file name is gone: expect False
 Test-Path .\footer_checker_lambda.py

@@ -1,7 +1,7 @@
 """
 glue_etl_job.py - AWS Bytes · Data Quality Check · Glue ETL checker (Glue job aws-bytes-dq-glue-etl)
 
-The same job as the Lambda checker (lambda_checker.py), done with AWS Glue (Spark) and
+The same job as the Lambda checker (lambda/lambda_checker.py), done with AWS Glue (Spark) and
 AWS Glue Data Quality: one landed TLC Yellow month per job run, the same contract (Glue table
 yellow_raw), the same statuses, the same outputs and the same file-log row shape.
 Approach name everywhere: "glue-etl" (S3 folders, file-log SK glue-etl#compare).
@@ -55,11 +55,20 @@ File log (DynamoDB aws-bytes-dq-file-log): one row per file, SK "glue-etl#compar
   dq_rules = every Glue Data Quality rule evaluated for this file with its outcome (Passed / Failed),
   tagged with its ruleset (files / schema / names / notes / rows).
 
-Job arguments (set by the measuring run state machine; defaults in infra/glue-template.yaml):
-  --file_key        S3 key of the landed file (raw/nyc-taxi/yellow/year=YYYY/month=MM/....parquet)
-  --bucket          lake bucket
-  --file_log_table  DynamoDB file log
+Spark use (one file per job run):
+  The landed file is read from S3 ONCE and kept in executor memory (spilled to local disk if it does not
+  fit): every ruleset below reads the cached copy, not S3 again. Glue Data Quality's own caching stays off
+  (CACHE_NOTHING) because the input is already cached here; caching it twice would only use more memory.
+  Tier 2 numbers each row (dq_row_id) and caches that numbered copy before the row rules run, so every
+  later step sees the same number for the same row. Each cache is released once nothing needs it.
+  read_partitions in the file log = how many Spark partitions (= tasks) the read produced for this file.
+
+Job arguments (set by the measuring run state machine; defaults in infra/template.yaml):
+  --file_key            S3 key of the landed file (raw/nyc-taxi/yellow/year=YYYY/month=MM/....parquet)
+  --bucket              lake bucket
+  --file_log_table      DynamoDB file log
   --glue_database, --glue_table   where the contract lives
+  --output_compression  Parquet codec for the rewritten valid / rejected files (e.g. snappy, zstd, gzip)
 """
 
 import datetime as dt                          # timestamps for the log row; month boundaries for rule R2
@@ -107,7 +116,8 @@ def start_glue():
 def job_args():
     """Required job arguments. The run ID is not needed here: the measuring run writes the real Glue
     run ID onto the row after the run (20-Nov: JOB_RUN_ID did not reach the script on Glue 5.0)."""
-    return getResolvedOptions(sys.argv, ["file_key", "bucket", "file_log_table", "glue_database", "glue_table"])
+    return getResolvedOptions(sys.argv, ["file_key", "bucket", "file_log_table", "glue_database", "glue_table",
+                                         "output_compression"])
 
 
 def s3_uri(bucket, key):
@@ -154,7 +164,7 @@ def evaluate(glue_ctx, df, ruleset, context, references=None, strict=True):
             "enableDataQualityCloudWatchMetrics": False,      # no CloudWatch metrics (no alarms use them)
             "enableDataQualityResultsPublishing": True,       # keep each run's scores in Glue
         },
-        additional_options={"performanceTuning.caching": "CACHE_NOTHING"},
+        additional_options={"performanceTuning.caching": "CACHE_NOTHING"},   # input is already cached by check_file()
         **extra,
     )
     rules = SelectFromCollection.apply(dfc=frames, key="ruleOutcomes").toDF().collect()
@@ -324,14 +334,14 @@ def zone_key(zone, key):
     return f"{zone}/{APPROACH}/" + key.split("/", 1)[1]
 
 
-def spark_write_parquet(df, uri):
-    """One Parquet part file (coalesce(1)) into the folder uri."""
-    df.coalesce(1).write.mode("overwrite").parquet(uri)
+def spark_write_parquet(df, uri, codec):
+    """One Parquet part file (coalesce(1) = one task writes it) into the folder uri, with an explicit codec."""
+    df.coalesce(1).write.mode("overwrite").option("compression", codec).parquet(uri)
 
 
-def write_one_file(df, bucket, staging, final_key, source_key):
+def write_one_file(df, bucket, staging, final_key, source_key, codec):
     """Spark writes a folder; keep its single part file under final_key, then delete the staging objects."""
-    spark_write_parquet(df, s3_uri(bucket, staging))
+    spark_write_parquet(df, s3_uri(bucket, staging), codec)
     objs = s3.list_objects_v2(Bucket=bucket, Prefix=staging).get("Contents", [])
     parts = [o["Key"] for o in objs if o["Key"].rsplit("/", 1)[-1].startswith("part-")]
     if len(parts) != 1:
@@ -342,7 +352,7 @@ def write_one_file(df, bucket, staging, final_key, source_key):
         s3.delete_object(Bucket=bucket, Key=o["Key"])
 
 
-def publish(bucket, key, res, valid_df, rejected_df):
+def publish(bucket, key, res, valid_df, rejected_df, codec):
     """Write this result's outputs, then delete copies an earlier result left in the other zones."""
     written = {}
     if res["status"] in ("passed", "quarantined"):
@@ -351,8 +361,8 @@ def publish(bucket, key, res, valid_df, rejected_df):
         written[zone] = zone_key(zone, key)
     else:                                                     # passed_with_rejects
         tmp = f"_tmp/{APPROACH}/{key}"                       # one scratch folder per landed file
-        write_one_file(valid_df, bucket, f"{tmp}/validated/", zone_key("validated", key), key)
-        write_one_file(rejected_df, bucket, f"{tmp}/rejected/", zone_key("rejected", key), key)
+        write_one_file(valid_df, bucket, f"{tmp}/validated/", zone_key("validated", key), key, codec)
+        write_one_file(rejected_df, bucket, f"{tmp}/rejected/", zone_key("rejected", key), key, codec)
         written["validated"] = zone_key("validated", key)
         written["rejected"] = zone_key("rejected", key)
     for zone in ZONES:                                        # re-published file changed result
@@ -406,10 +416,12 @@ def check_file(glue_ctx, spark, args):
         reasons.append(f"Glue DQ rule failed: {r['rule']}{detail}")
     lap("dq_files")
 
-    # check 1 (own code): Spark can read it (the read parses the footer; count() reads row-group metadata)
+    # check 1 (own code): Spark can read it. persist() + count() = the ONE read of the file from S3: count()
+    # is the first action, so it fills the cache; every later ruleset reads the cached copy, not S3.
     try:
-        df = spark.read.parquet(s3_uri(bucket, key))
+        df = spark.read.parquet(s3_uri(bucket, key)).persist(StorageLevel.MEMORY_AND_DISK)
         res["num_rows"] = df.count()
+        res["read_partitions"] = df.rdd.getNumPartitions()   # partitions = tasks per stage on this file
         lap("read")
     except Exception as e:                                    # Spark raises Java errors through Py4J
         reasons.append(f"not readable Parquet: {root_cause(e)[:300]}")
@@ -465,7 +477,15 @@ def check_file(glue_ctx, spark, args):
         return res, None, None
 
     # ---- Tier 2 (rows) ----
-    low = df.toDF(*[c.lower() for c in df.columns]).withColumn(ROW_ID, F.monotonically_increasing_id())
+    # monotonically_increasing_id() is built from the partition number + the row's place in it, so it is only
+    # stable while the partitions stay the same. Cache the numbered rows and fill the cache now (count()),
+    # so the row rules and every later step read the SAME numbers; then the unnumbered copy is not needed.
+    low = (df.toDF(*[c.lower() for c in df.columns])
+           .withColumn(ROW_ID, F.monotonically_increasing_id())
+           .persist(StorageLevel.MEMORY_AND_DISK))
+    low.count()
+    df.unpersist()
+    lap("number_rows")
     ym = file_month(key)
     if not ym:
         notes.append(f"file month not found in the key; rule {R2} skipped")
@@ -495,6 +515,7 @@ def check_file(glue_ctx, spark, args):
     counts = {R1: int(agg[R1] or 0), R2: int(agg[R2] or 0) if R2 in marks.values() else 0}
     n_rejected = int(agg["bad"] or 0)
     res.update(rows_valid=int(agg["n"]) - n_rejected, rows_rejected=n_rejected, rejects_by_rule=counts)
+    low.unpersist()                                           # flagged is fully cached now; the writes read it
     lap("dq_rows")
 
     # back to the file's own column names and order; rejected rows get dq_reasons ("R1;R2", NULLs skipped)
@@ -517,7 +538,7 @@ def main():
     table = boto3.resource("dynamodb").Table(args["file_log_table"])
     log_row(table, dict(res, copied=False))
     t1 = time.time()
-    written = publish(args["bucket"], args["file_key"], res, valid_df, rejected_df)
+    written = publish(args["bucket"], args["file_key"], res, valid_df, rejected_df, args["output_compression"])
     mark_copied(table, args["file_key"], written, int((time.time() - t1) * 1000))
     print({k: res.get(k) for k in ("file", "status", "num_rows", "rows_rejected", "rejects_by_rule", "reasons")})
 

@@ -88,7 +88,7 @@ aws stepfunctions start-execution --state-machine-arn arn:aws:states:ap-south-1:
 
 **Flow:** `ListLandedFiles` → `CheckFiles` sends each file to the Lambda (5 at a time) → `Summarise` → `AnyErrors`.
 
-**The function** ([`lambda_checker.py`](lambda_checker.py)) runs every check as own code: the file checks read only S3 metadata and the Parquet footer; the row checks read 250,000 rows at a time. It also runs on every new file as it lands (S3 → EventBridge → Lambda).
+**The function** ([`lambda/lambda_checker.py`](lambda/lambda_checker.py)) runs every check as own code: the file checks read only S3 metadata and the Parquet footer; the row checks read 250,000 rows at a time. It also runs on every new file as it lands (S3 → EventBridge → Lambda).
 
 **Run:**
 ```bash
@@ -116,7 +116,7 @@ aws stepfunctions describe-execution --execution-arn <ExecutionArn> --query "[st
 
 **Flow:** `ListLandedFiles` → `CheckFiles` starts one Glue job run per file (40 at a time) and waits for it → `StampRunId` writes the Glue run ID on the file's log row → `Summarise` → `AnyErrors`.
 
-**The job** ([`glue_etl_job.py`](glue_etl_job.py), Glue 5.0, 2 workers) reads the landed file itself, so it sees the file's own columns and types, and runs the checks as 5 Glue Data Quality rulesets:
+**The job** ([`glue/glue_etl_job.py`](glue/glue_etl_job.py), Glue 5.0, 2 workers) reads the landed file itself, so it sees the file's own columns and types, and runs the checks as 5 Glue Data Quality rulesets:
 
 | Ruleset (job's Data quality tab) | Rules | Checks |
 |---|---|---|

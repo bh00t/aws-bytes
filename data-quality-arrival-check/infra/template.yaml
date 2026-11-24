@@ -22,8 +22,8 @@
 #          EventBridge Scheduler (every 15 min) -> alert notifier Lambda -> ONE SNS email PER APPROACH -> rows marked "sent"
 #   RUN    IAM role poc-dq-runner = the only identity used to start runs and read results
 #
-# Files: infra/template.yaml (this file); lander_lambda.py, lambda_checker.py, alert_notifier_lambda.py,
-#        glue_etl_job.py, runbook.ps1 in the PoC folder above it. Code paths below are relative to this file, hence ../
+# Files: infra/template.yaml (this file); in the PoC folder above it: lander_lambda.py, alert_notifier_lambda.py,
+#        runbook.ps1, lambda/lambda_checker.py, glue/glue_etl_job.py. Code paths below are relative to this file, hence ../
 # No input files: the land run works out its own month list, the measuring runs list S3 themselves.
 #
 # Deploy: "aws cloudformation package" zips each Lambda .py file named under Code:, uploads the Glue
@@ -46,6 +46,19 @@ Parameters:
   AlertEmail:
     Type: String
     AllowedPattern: ".+@.+"
+  # The bucket you pass to "aws cloudformation package --s3-bucket" (the Glue job reads its script from it).
+  # Empty = the default name aws-bytes-deploy-<account>-<region>.
+  DeployBucketName:
+    Type: String
+    Default: ""
+  # Parquet codec for the files the Glue job rewrites (valid rows / rejected rows). Spark's own default is snappy.
+  GlueOutputCompression:
+    Type: String
+    Default: snappy
+    AllowedValues: [snappy, zstd, gzip, lz4, none]
+
+Conditions:
+  DeployBucketGiven: !Not [!Equals [!Ref DeployBucketName, ""]]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -405,7 +418,7 @@ Resources:
       Runtime: python3.12
       Architectures: [arm64]
       Handler: lambda_checker.handler
-      Code: ../lambda_checker.py                # "package" zips this one file (path is relative to infra/)
+      Code: ../lambda/lambda_checker.py         # "package" zips this one file (path is relative to infra/)
       Layers: [!Ref PandasLayerArn]             # pyarrow comes from the managed layer
       MemorySize: 2048                          # Tier 2 reads rows: measured peak ~670 MB on a 7.9M-row, 292 MB test file
                                                 # (more memory also gives the function more CPU)
@@ -418,6 +431,10 @@ Resources:
           FILE_LOG_TABLE: !Ref FileLogTable
           GLUE_DATABASE: aws_bytes_lake         # where the contract lives
           GLUE_TABLE: yellow_raw
+      Tags:                                     # cost allocation tags (activate once in Billing; up to 24 h to appear)
+        - { Key: project, Value: aws-bytes }
+        - { Key: poc, Value: data-quality-arrival-check }
+        - { Key: approach, Value: lambda }
 
   # Async invokes (from EventBridge): 2 retries, events kept up to 6 h, then sent to the queue
   FooterCheckerAsyncConfig:
@@ -707,7 +724,14 @@ Resources:
               - Sid: ReadScript                 # the job script uploaded by "cloudformation package"
                 Effect: Allow
                 Action: s3:GetObject
-                Resource: !Sub arn:aws:s3:::aws-bytes-deploy-${AWS::AccountId}-${AWS::Region}/data-quality-arrival-check/*
+                Resource: !If
+                  - DeployBucketGiven
+                  - !Sub arn:aws:s3:::${DeployBucketName}/data-quality-arrival-check/*
+                  - !Sub arn:aws:s3:::aws-bytes-deploy-${AWS::AccountId}-${AWS::Region}/data-quality-arrival-check/*
+              - Sid: SparkUiLogs                # Spark event logs, backed up every 30 s; the console Spark UI reads them
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+                Resource: !Sub ${LakeBucket.Arn}/_spark-ui/glue-etl/*
               - Sid: ListLake                   # Spark lists folders when it reads and writes
                 Effect: Allow
                 Action: s3:ListBucket
@@ -773,7 +797,7 @@ Resources:
       Command:
         Name: glueetl
         PythonVersion: "3"
-        ScriptLocation: ../glue_etl_job.py      # "package" uploads this file as-is (path is relative to infra/)
+        ScriptLocation: ../glue/glue_etl_job.py   # "package" uploads this file as-is (path is relative to infra/)
       DefaultArguments:
         "--job-language": python
         "--bucket": !Ref LakeBucket
@@ -781,6 +805,13 @@ Resources:
         "--glue_database": aws_bytes_lake
         "--glue_table": yellow_raw
         "--file_key": none                      # always replaced by the measuring run (one file per run)
+        "--output_compression": !Ref GlueOutputCompression
+        "--enable-spark-ui": "true"             # Spark UI in the Glue console (job -> Runs -> run), live and after the run
+        "--spark-event-logs-path": !Sub s3://${LakeBucket}/_spark-ui/glue-etl/   # outside raw/: no checker event
+      Tags:                                     # cost allocation tags (activate once in Billing; up to 24 h to appear)
+        project: aws-bytes
+        poc: data-quality-arrival-check
+        approach: glue-etl
 
   # ---------------------------------------------------------------------------
   # MEASURING RUN (glue-etl approach) - Step Functions: the Glue job once per landed file (SK glue-etl#compare)

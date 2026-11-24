@@ -457,7 +457,7 @@ def handler(event, context=None):
 
 
 if __name__ == "__main__":
-    # Laptop dry run as the runner role:  python lambda_checker.py BUCKET KEY
+    # Laptop dry run as the runner role (from the PoC folder):  python lambda\lambda_checker.py BUCKET KEY
     # (set GLUE_DATABASE=aws_bytes_lake and GLUE_TABLE=yellow_raw first: the contract is read from Glue;
     #  set TMP_DIR if /tmp does not exist, e.g. on Windows)
     import json
